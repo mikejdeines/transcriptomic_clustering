@@ -129,3 +129,32 @@ def test_de_pairs_ebayes(cl_stats, thresholds):
 
     np.testing.assert_almost_equal(de_pairs.loc[('a','c')]['score'], 84.26030647753015, decimal=10)
     assert set(de_pairs.loc[('a','c')]['up_genes']) == set(up_genes_expected)
+
+
+def test_de_pairs_ebayes_parallel_matches_serial(cl_stats, thresholds):
+    cl_means = cl_stats['cl_means']
+    cl_vars = cl_stats['cl_vars']
+    cl_present = cl_stats['cl_present']
+    cl_size = cl_stats['cl_size']
+    pairs = [('a', 'b'), ('a', 'c'), ('b', 'c')]
+
+    de_pairs_serial = de_pairs_ebayes(
+        pairs,
+        cl_means,
+        cl_vars,
+        cl_present,
+        cl_size,
+        thresholds,
+        n_cores=1,
+    )
+    de_pairs_parallel = de_pairs_ebayes(
+        pairs,
+        cl_means,
+        cl_vars,
+        cl_present,
+        cl_size,
+        thresholds,
+        n_cores=2,
+    )
+
+    assert_frame_equal(de_pairs_parallel, de_pairs_serial)

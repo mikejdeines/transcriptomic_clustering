@@ -1,6 +1,9 @@
 from typing import Optional, Tuple, List, Dict, Union, Any
 from numpy.core.fromnumeric import var
 from numpy.typing import ArrayLike
+from concurrent.futures import ProcessPoolExecutor, as_completed
+import math
+import os
 
 import warnings
 import logging
@@ -16,6 +19,8 @@ from statsmodels.stats.multitest import multipletests
 from .diff_expression import get_qdiff, filter_gene_stats, calc_de_score
 
 logger = logging.getLogger(__name__)
+
+_DE_PAIR_CONTEXT = None
 
 """
 Implements functions for calculating differential expression
@@ -134,6 +139,112 @@ def get_linear_fit_vals(cl_vars: pd.DataFrame, cl_size: Dict[Any, int]):
     return sigma_sq.to_frame(), df, stdev_unscaled
 
 
+def compute_de_pair_ebayes(
+        cluster_a: Any,
+        cluster_b: Any,
+        cl_means: pd.DataFrame,
+        cl_present: pd.DataFrame,
+        cl_size: Dict[Any, int],
+        de_thresholds: Dict[str, Any],
+        sigma_sq_post: pd.DataFrame,
+        stdev_unscaled: pd.DataFrame,
+        df_total: float,
+    ) -> Dict[str, Any]:
+    """Compute DE statistics for a single cluster pair."""
+    means_diff = cl_means.loc[cluster_a] - cl_means.loc[cluster_b]
+    means_diff = means_diff.to_frame()
+    stdev_unscaled_comb = np.sqrt(np.sum(stdev_unscaled.loc[[cluster_a, cluster_b]] ** 2))[0]
+
+    t_vals = means_diff / np.sqrt(sigma_sq_post) / stdev_unscaled_comb
+
+    p_vals = 2 * stats.t.sf(np.abs(t_vals[0]), df_total)
+    _, p_adj, _, _ = multipletests(
+        p_vals,
+        alpha=de_thresholds['padj_thresh'],
+        method='holm',
+    )
+
+    de_pair_stats = pd.DataFrame(index=cl_means.columns)
+    de_pair_stats['p_value'] = p_vals
+    de_pair_stats['p_adj'] = p_adj
+    de_pair_stats['lfc'] = means_diff
+    de_pair_stats["meanA"] = cl_means.loc[cluster_a]
+    de_pair_stats["meanB"] = cl_means.loc[cluster_b]
+    de_pair_stats["q1"] = cl_present.loc[cluster_a]
+    de_pair_stats["q2"] = cl_present.loc[cluster_b]
+    de_pair_stats["qdiff"] = get_qdiff(cl_present.loc[cluster_a], cl_present.loc[cluster_b])
+
+    de_pair_up = filter_gene_stats(
+        de_stats=de_pair_stats,
+        gene_type='up-regulated',
+        cl1_size=cl_size[cluster_a],
+        cl2_size=cl_size[cluster_b],
+        **de_thresholds
+    )
+    up_score = calc_de_score(de_pair_up['p_adj'].values)
+
+    de_pair_down = filter_gene_stats(
+        de_stats=de_pair_stats,
+        gene_type='down-regulated',
+        cl1_size=cl_size[cluster_a],
+        cl2_size=cl_size[cluster_b],
+        **de_thresholds
+    )
+    down_score = calc_de_score(de_pair_down['p_adj'].values)
+
+    return {
+        'score': up_score + down_score,
+        'up_score': up_score,
+        'down_score': down_score,
+        'up_genes': de_pair_up.index.to_list(),
+        'down_genes': de_pair_down.index.to_list(),
+        'up_num': len(de_pair_up.index),
+        'down_num': len(de_pair_down.index),
+        'num': len(de_pair_up.index) + len(de_pair_down.index)
+    }
+
+
+def init_de_pair_worker(
+        cl_means: pd.DataFrame,
+        cl_present: pd.DataFrame,
+        cl_size: Dict[Any, int],
+        de_thresholds: Dict[str, Any],
+        sigma_sq_post: pd.DataFrame,
+        stdev_unscaled: pd.DataFrame,
+        df_total: float,
+    ):
+    """Initialize global context for DE worker processes."""
+    global _DE_PAIR_CONTEXT
+    _DE_PAIR_CONTEXT = {
+        'cl_means': cl_means,
+        'cl_present': cl_present,
+        'cl_size': cl_size,
+        'de_thresholds': de_thresholds,
+        'sigma_sq_post': sigma_sq_post,
+        'stdev_unscaled': stdev_unscaled,
+        'df_total': df_total,
+    }
+
+
+def process_de_pair_chunk(pair_chunk: List[Tuple[Any, Any]]) -> Dict[Tuple[Any, Any], Dict[str, Any]]:
+    """Compute DE stats for a chunk of cluster pairs in one worker."""
+    context = _DE_PAIR_CONTEXT
+    de_pairs_chunk = {}
+    for cluster_a, cluster_b in pair_chunk:
+        de_pairs_chunk[(cluster_a, cluster_b)] = compute_de_pair_ebayes(
+            cluster_a=cluster_a,
+            cluster_b=cluster_b,
+            cl_means=context['cl_means'],
+            cl_present=context['cl_present'],
+            cl_size=context['cl_size'],
+            de_thresholds=context['de_thresholds'],
+            sigma_sq_post=context['sigma_sq_post'],
+            stdev_unscaled=context['stdev_unscaled'],
+            df_total=context['df_total'],
+        )
+    return de_pairs_chunk
+
+
 def de_pairs_ebayes(
         pairs: List[Tuple[Any, Any]],
         cl_means: pd.DataFrame,
@@ -141,6 +252,7 @@ def de_pairs_ebayes(
         cl_present: pd.DataFrame,
         cl_size: Dict[Any, int],
         de_thresholds: Dict[str, Any],
+    n_cores: Optional[int] = 1,
     ):
     """
     Computes moderated t-statistics for pairs of cluster
@@ -161,74 +273,69 @@ def de_pairs_ebayes(
                  values = per cluster variance of gene expression
     cl_size: dict of cluster name: number of observations in cluster
     de_thresholds: thresholds for filter de
+    n_cores: number of processes to use for pairwise DE computation.
+        If None, uses all available CPU cores.
 
     Returns
     -------
     Dict with key: cluster_pair, value: dict of de values
     """
+    if len(pairs) == 0:
+        return pd.DataFrame()
+
     logger.info('Fitting Variances')
     sigma_sq, df, stdev_unscaled = get_linear_fit_vals(cl_vars, cl_size)
     logger.info('Moderating Variances')
     sigma_sq_post, var_prior, df_prior = moderate_variances(sigma_sq, df)
 
     logger.info(f'Comparing {len(pairs)} pairs')
+    if n_cores is None:
+        n_workers = os.cpu_count() or 1
+    else:
+        n_workers = int(n_cores)
+    if n_workers < 1:
+        raise ValueError('n_cores must be >= 1 or None')
+    n_workers = min(n_workers, len(pairs))
+
+    df_total = df + df_prior
+    df_pooled = np.sum(df)
+    df_total = min(df_total, df_pooled)
+
     de_pairs = {}
-    for (cluster_a, cluster_b) in pairs:
-        # t-test with ebayes adjusted variances
-        means_diff = cl_means.loc[cluster_a] - cl_means.loc[cluster_b]
-        means_diff = means_diff.to_frame()
-        stdev_unscaled_comb = np.sqrt(np.sum(stdev_unscaled.loc[[cluster_a, cluster_b]] ** 2))[0]
-        
-        df_total = df + df_prior
-        df_pooled = np.sum(df)
-        df_total = min(df_total, df_pooled)
-        
-        t_vals = means_diff / np.sqrt(sigma_sq_post) / stdev_unscaled_comb
-        
-        p_adj = np.ones((len(t_vals),))
-        p_vals = 2 * stats.t.sf(np.abs(t_vals[0]), df_total)
-        reject, p_adj, alphacSidak, alphacBonf= multipletests(p_vals, alpha=de_thresholds['padj_thresh'], method='holm')
-        lfc = means_diff
+    if n_workers == 1:
+        for cluster_a, cluster_b in pairs:
+            de_pairs[(cluster_a, cluster_b)] = compute_de_pair_ebayes(
+                cluster_a=cluster_a,
+                cluster_b=cluster_b,
+                cl_means=cl_means,
+                cl_present=cl_present,
+                cl_size=cl_size,
+                de_thresholds=de_thresholds,
+                sigma_sq_post=sigma_sq_post,
+                stdev_unscaled=stdev_unscaled,
+                df_total=df_total,
+            )
+    else:
+        chunk_size = max(1, math.ceil(len(pairs) / (n_workers * 4)))
+        pair_chunks = [pairs[idx:idx + chunk_size] for idx in range(0, len(pairs), chunk_size)]
+        logger.info(f'Using {n_workers} workers across {len(pair_chunks)} chunks')
+        with ProcessPoolExecutor(
+                max_workers=n_workers,
+                initializer=init_de_pair_worker,
+                initargs=(
+                    cl_means,
+                    cl_present,
+                    cl_size,
+                    de_thresholds,
+                    sigma_sq_post,
+                    stdev_unscaled,
+                    df_total,
+                ),
+            ) as executor:
+            futures = [executor.submit(process_de_pair_chunk, chunk) for chunk in pair_chunks]
+            for future in as_completed(futures):
+                de_pairs.update(future.result())
 
-        # Get DE score
-        de_pair_stats = pd.DataFrame(index=cl_means.columns)
-        de_pair_stats['p_value'] = p_vals
-        de_pair_stats['p_adj'] = p_adj
-        de_pair_stats['lfc'] = lfc
-        de_pair_stats["meanA"] = cl_means.loc[cluster_a]
-        de_pair_stats["meanB"] = cl_means.loc[cluster_b]
-        de_pair_stats["q1"] = cl_present.loc[cluster_a]
-        de_pair_stats["q2"] = cl_present.loc[cluster_b]
-        de_pair_stats["qdiff"] = get_qdiff(cl_present.loc[cluster_a], cl_present.loc[cluster_b])
-
-        de_pair_up = filter_gene_stats(
-            de_stats=de_pair_stats,
-            gene_type='up-regulated', 
-            cl1_size=cl_size[cluster_a],
-            cl2_size=cl_size[cluster_b],
-            **de_thresholds
-        )
-        up_score = calc_de_score(de_pair_up['p_adj'].values)
-
-        de_pair_down = filter_gene_stats(
-            de_stats=de_pair_stats,
-            gene_type='down-regulated',
-            cl1_size=cl_size[cluster_a],
-            cl2_size=cl_size[cluster_b],
-            **de_thresholds
-        )
-        down_score = calc_de_score(de_pair_down['p_adj'].values)
-
-        de_pairs[(cluster_a, cluster_b)] = {
-            'score': up_score + down_score,
-            'up_score': up_score,
-            'down_score': down_score,
-            'up_genes': de_pair_up.index.to_list(),
-            'down_genes': de_pair_down.index.to_list(),
-            'up_num': len(de_pair_up.index),
-            'down_num': len(de_pair_down.index),
-            'num': len(de_pair_up.index) + len(de_pair_down.index)
-        }
-
-    de_pairs = pd.DataFrame(de_pairs).T
-    return de_pairs
+    de_pairs_df = pd.DataFrame(de_pairs).T
+    de_pairs_df = de_pairs_df.reindex(pd.MultiIndex.from_tuples(pairs))
+    return de_pairs_df
