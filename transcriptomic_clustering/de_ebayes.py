@@ -1,7 +1,7 @@
 from typing import Optional, Tuple, List, Dict, Union, Any
 from numpy.core.fromnumeric import var
 from numpy.typing import ArrayLike
-from concurrent.futures import ProcessPoolExecutor, as_completed
+import multiprocessing as mp
 import math
 import os
 from pathlib import Path
@@ -248,6 +248,14 @@ def process_de_pair_chunk(pair_chunk: List[Tuple[Any, Any]]) -> Dict[Tuple[Any, 
     return de_pairs_chunk
 
 
+def process_de_pair_chunk_indexed(
+        indexed_pair_chunk: Tuple[int, List[Tuple[Any, Any]]]
+    ) -> Tuple[int, Dict[Tuple[Any, Any], Dict[str, Any]]]:
+    """Worker entrypoint that preserves the source chunk index."""
+    chunk_idx, pair_chunk = indexed_pair_chunk
+    return chunk_idx, process_de_pair_chunk(pair_chunk)
+
+
 def chunk_pairs(
         pairs: List[Tuple[Any, Any]],
         n_workers: int,
@@ -413,8 +421,12 @@ def de_pairs_ebayes(
             )
     else:
         logger.info(f'Using {n_workers} workers across {len(pair_chunks)} chunks')
-        with ProcessPoolExecutor(
-                max_workers=n_workers,
+        mp_context = mp.get_context('fork')
+        logger.info("Using multiprocessing start method 'fork'")
+
+        indexed_chunks = list(enumerate(pair_chunks))
+        with mp_context.Pool(
+            processes=n_workers,
                 initializer=init_de_pair_worker,
                 initargs=(
                     cl_means,
@@ -425,13 +437,14 @@ def de_pairs_ebayes(
                     stdev_unscaled,
                     df_total,
                 ),
-            ) as executor:
-            futures = {
-                executor.submit(process_de_pair_chunk, chunk): chunk for chunk in pair_chunks
-            }
-            for future in as_completed(futures):
-                pair_chunk = futures[future]
-                de_pairs_chunk = future.result()
+                maxtasksperchild=100,
+            ) as pool:
+            for chunk_idx, de_pairs_chunk in pool.imap_unordered(
+                process_de_pair_chunk_indexed,
+                indexed_chunks,
+                chunksize=1,
+            ):
+                pair_chunk = pair_chunks[chunk_idx]
                 if parquet_writer is None:
                     de_pairs.update(de_pairs_chunk)
                 else:

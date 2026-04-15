@@ -20,6 +20,7 @@ def select_marker_genes(
         thresholds: Dict[str, Any],
         n_markers: int = 20,
         de_method: Optional[Literal['ebayes', 'chisq']] = 'ebayes',
+    de_n_cores: Optional[int] = 1,
 ) -> Set:
     """
     Selects n up genes and n down genes from the differentially expressed genes
@@ -33,6 +34,8 @@ def select_marker_genes(
         number of markers to select from both differentially up and down genes
     de_method:
         method used for de calculation
+    de_n_cores:
+        number of processes to use for ebayes DE (ignored for chisq)
     thresholds:
         threshold use de calculation
     
@@ -65,6 +68,7 @@ def select_marker_genes(
             present_cluster_means,
             cl_size,
             thresholds,
+            n_cores=de_n_cores,
         )
     elif de_method == 'chisq':
         de_df = tc.de_pairs_chisq(

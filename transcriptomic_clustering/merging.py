@@ -34,7 +34,8 @@ def merge_clusters(
         k: Optional[int] = 2,
         de_method: Optional[str] = 'ebayes',
         n_markers: Optional[int] = 20,
-        chunk_size: Optional[int] = None
+    chunk_size: Optional[int] = None,
+    de_n_cores: Optional[int] = 1,
 ) -> Tuple[Dict[Any, np.ndarray], Set]:
     """
     Merge clusters based on size and differential gene expression score
@@ -63,6 +64,8 @@ def merge_clusters(
         if 0 or None will skip
     chunk_size:
         number of observations to process in a single chunk
+    de_n_cores:
+        number of processes to use for ebayes DE (ignored for chisq)
 
     Returns
     -------
@@ -126,6 +129,7 @@ def merge_clusters(
                          thresholds,
                          k,
                          de_method,
+                         de_n_cores,
                          )
     logger.info(f'Completed Merging Clusters by DE')
     toc = time.perf_counter()
@@ -143,6 +147,7 @@ def merge_clusters(
             thresholds=thresholds,
             n_markers=n_markers,
             de_method=de_method,
+            de_n_cores=de_n_cores,
         )
         logger.info('Completed Marker Selection')
         toc = time.perf_counter()
@@ -414,6 +419,7 @@ def merge_clusters_by_de(
     thresholds: Dict[str, Any],
     k: Optional[int] = 2,
     de_method: Optional[Literal['ebayes', 'chisq']] = 'ebayes',
+    de_n_cores: Optional[int] = 1,
 ):
     """
     Merge clusters by the calculated gene differential expression score
@@ -438,6 +444,8 @@ def merge_clusters_by_de(
         number of cluster neighbors
     de_method:
         method used for de calculation
+    de_n_cores:
+        number of processes to use for ebayes DE (ignored for chisq)
     thresholds:
         threshold use de calculation
 
@@ -474,6 +482,7 @@ def merge_clusters_by_de(
                 present_cluster_means,
                 cl_size,
                 thresholds,
+                n_cores=de_n_cores,
             )
         elif de_method == 'chisq':
             scores = tc.de_pairs_chisq(
