@@ -158,3 +158,42 @@ def test_de_pairs_ebayes_parallel_matches_serial(cl_stats, thresholds):
     )
 
     assert_frame_equal(de_pairs_parallel, de_pairs_serial)
+
+
+def test_de_pairs_ebayes_parquet_matches_serial(cl_stats, thresholds, tmp_path):
+    cl_means = cl_stats['cl_means']
+    cl_vars = cl_stats['cl_vars']
+    cl_present = cl_stats['cl_present']
+    cl_size = cl_stats['cl_size']
+    pairs = [('a', 'b'), ('a', 'c'), ('b', 'c')]
+
+    expected = de_pairs_ebayes(
+        pairs,
+        cl_means,
+        cl_vars,
+        cl_present,
+        cl_size,
+        thresholds,
+        n_cores=1,
+    )
+
+    parquet_path = tmp_path / 'de_pairs.parquet'
+    result_path = de_pairs_ebayes(
+        pairs,
+        cl_means,
+        cl_vars,
+        cl_present,
+        cl_size,
+        thresholds,
+        n_cores=2,
+        parquet_path=parquet_path,
+    )
+
+    assert result_path == parquet_path
+
+    actual = pd.read_parquet(parquet_path)
+    actual = actual.set_index(['cluster_a', 'cluster_b'])
+    actual.index = pd.MultiIndex.from_tuples(actual.index.tolist())
+    actual = actual.reindex(expected.index)
+
+    assert_frame_equal(actual, expected, check_like=False, check_dtype=False)

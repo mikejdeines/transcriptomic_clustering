@@ -4,6 +4,7 @@ from numpy.typing import ArrayLike
 from concurrent.futures import ProcessPoolExecutor, as_completed
 import math
 import os
+from pathlib import Path
 
 import warnings
 import logging
@@ -12,6 +13,8 @@ import time
 import numpy as np
 import pandas as pd
 import scanpy as sc
+import pyarrow as pa
+import pyarrow.parquet as pq
 from scipy import stats
 from scipy.special import digamma, polygamma
 from statsmodels.stats.multitest import multipletests
@@ -245,6 +248,64 @@ def process_de_pair_chunk(pair_chunk: List[Tuple[Any, Any]]) -> Dict[Tuple[Any, 
     return de_pairs_chunk
 
 
+def chunk_pairs(
+        pairs: List[Tuple[Any, Any]],
+        n_workers: int,
+    ) -> List[List[Tuple[Any, Any]]]:
+    """Split pairs into moderately sized chunks for serial or parallel execution."""
+    chunk_size = max(1, math.ceil(len(pairs) / max(1, n_workers * 4)))
+    return [pairs[idx:idx + chunk_size] for idx in range(0, len(pairs), chunk_size)]
+
+
+def de_pair_chunk_to_frame(
+        pair_chunk: List[Tuple[Any, Any]],
+        de_pairs_chunk: Dict[Tuple[Any, Any], Dict[str, Any]],
+    ) -> pd.DataFrame:
+    """Convert a chunk result into a frame while preserving the requested pair order."""
+    records = []
+    for cluster_a, cluster_b in pair_chunk:
+        row = de_pairs_chunk[(cluster_a, cluster_b)].copy()
+        row['cluster_a'] = cluster_a
+        row['cluster_b'] = cluster_b
+        records.append(row)
+    return pd.DataFrame.from_records(records)
+
+
+def make_de_pairs_table_schema() -> pa.Schema:
+    """Schema used for streamed parquet output."""
+    return pa.schema([
+        pa.field('cluster_a', pa.string()),
+        pa.field('cluster_b', pa.string()),
+        pa.field('score', pa.float64()),
+        pa.field('up_score', pa.float64()),
+        pa.field('down_score', pa.float64()),
+        pa.field('up_genes', pa.list_(pa.string())),
+        pa.field('down_genes', pa.list_(pa.string())),
+        pa.field('up_num', pa.int64()),
+        pa.field('down_num', pa.int64()),
+        pa.field('num', pa.int64()),
+    ])
+
+
+def frame_to_de_pairs_table(frame: pd.DataFrame) -> pa.Table:
+    """Build a pyarrow table for a DE result chunk."""
+    return pa.Table.from_arrays(
+        [
+            pa.array(frame['cluster_a'].astype(str).tolist(), type=pa.string()),
+            pa.array(frame['cluster_b'].astype(str).tolist(), type=pa.string()),
+            pa.array(frame['score'].tolist(), type=pa.float64()),
+            pa.array(frame['up_score'].tolist(), type=pa.float64()),
+            pa.array(frame['down_score'].tolist(), type=pa.float64()),
+            pa.array(frame['up_genes'].tolist(), type=pa.list_(pa.string())),
+            pa.array(frame['down_genes'].tolist(), type=pa.list_(pa.string())),
+            pa.array(frame['up_num'].tolist(), type=pa.int64()),
+            pa.array(frame['down_num'].tolist(), type=pa.int64()),
+            pa.array(frame['num'].tolist(), type=pa.int64()),
+        ],
+        schema=make_de_pairs_table_schema(),
+    )
+
+
 def de_pairs_ebayes(
         pairs: List[Tuple[Any, Any]],
         cl_means: pd.DataFrame,
@@ -252,7 +313,8 @@ def de_pairs_ebayes(
         cl_present: pd.DataFrame,
         cl_size: Dict[Any, int],
         de_thresholds: Dict[str, Any],
-    n_cores: Optional[int] = 1,
+        n_cores: Optional[int] = 1,
+        parquet_path: Optional[Union[str, os.PathLike]] = None,
     ):
     """
     Computes moderated t-statistics for pairs of cluster
@@ -275,10 +337,12 @@ def de_pairs_ebayes(
     de_thresholds: thresholds for filter de
     n_cores: number of processes to use for pairwise DE computation.
         If None, uses all available CPU cores.
+    parquet_path: optional output parquet path. When provided, results are
+        streamed to disk with pyarrow instead of being accumulated in memory.
 
     Returns
     -------
-    Dict with key: cluster_pair, value: dict of de values
+    DataFrame of DE results, or parquet path when parquet output is requested.
     """
     if len(pairs) == 0:
         return pd.DataFrame()
@@ -301,23 +365,39 @@ def de_pairs_ebayes(
     df_pooled = np.sum(df)
     df_total = min(df_total, df_pooled)
 
-    de_pairs = {}
-    if n_workers == 1:
-        for cluster_a, cluster_b in pairs:
-            de_pairs[(cluster_a, cluster_b)] = compute_de_pair_ebayes(
-                cluster_a=cluster_a,
-                cluster_b=cluster_b,
-                cl_means=cl_means,
-                cl_present=cl_present,
-                cl_size=cl_size,
-                de_thresholds=de_thresholds,
-                sigma_sq_post=sigma_sq_post,
-                stdev_unscaled=stdev_unscaled,
-                df_total=df_total,
-            )
+    pair_chunks = chunk_pairs(pairs, n_workers)
+    if parquet_path is not None:
+        parquet_path = Path(parquet_path)
+        parquet_path.parent.mkdir(parents=True, exist_ok=True)
+        if parquet_path.exists():
+            parquet_path.unlink()
+        parquet_writer = pq.ParquetWriter(parquet_path, make_de_pairs_table_schema())
     else:
-        chunk_size = max(1, math.ceil(len(pairs) / (n_workers * 4)))
-        pair_chunks = [pairs[idx:idx + chunk_size] for idx in range(0, len(pairs), chunk_size)]
+        parquet_writer = None
+        de_pairs = {}
+
+    if n_workers == 1:
+        for pair_chunk in pair_chunks:
+            de_pairs_chunk = {}
+            for cluster_a, cluster_b in pair_chunk:
+                de_pairs_chunk[(cluster_a, cluster_b)] = compute_de_pair_ebayes(
+                    cluster_a=cluster_a,
+                    cluster_b=cluster_b,
+                    cl_means=cl_means,
+                    cl_present=cl_present,
+                    cl_size=cl_size,
+                    de_thresholds=de_thresholds,
+                    sigma_sq_post=sigma_sq_post,
+                    stdev_unscaled=stdev_unscaled,
+                    df_total=df_total,
+                )
+            if parquet_writer is None:
+                de_pairs.update(de_pairs_chunk)
+            else:
+                parquet_writer.write_table(
+                    frame_to_de_pairs_table(de_pair_chunk_to_frame(pair_chunk, de_pairs_chunk))
+                )
+    else:
         logger.info(f'Using {n_workers} workers across {len(pair_chunks)} chunks')
         with ProcessPoolExecutor(
                 max_workers=n_workers,
@@ -332,9 +412,22 @@ def de_pairs_ebayes(
                     df_total,
                 ),
             ) as executor:
-            futures = [executor.submit(process_de_pair_chunk, chunk) for chunk in pair_chunks]
+            futures = {
+                executor.submit(process_de_pair_chunk, chunk): chunk for chunk in pair_chunks
+            }
             for future in as_completed(futures):
-                de_pairs.update(future.result())
+                pair_chunk = futures[future]
+                de_pairs_chunk = future.result()
+                if parquet_writer is None:
+                    de_pairs.update(de_pairs_chunk)
+                else:
+                    parquet_writer.write_table(
+                        frame_to_de_pairs_table(de_pair_chunk_to_frame(pair_chunk, de_pairs_chunk))
+                    )
+
+    if parquet_writer is not None:
+        parquet_writer.close()
+        return parquet_path
 
     de_pairs_df = pd.DataFrame(de_pairs).T
     de_pairs_df = de_pairs_df.reindex(pd.MultiIndex.from_tuples(pairs))
