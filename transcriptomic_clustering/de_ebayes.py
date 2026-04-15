@@ -366,6 +366,10 @@ def de_pairs_ebayes(
     df_total = min(df_total, df_pooled)
 
     pair_chunks = chunk_pairs(pairs, n_workers)
+    total_chunks = len(pair_chunks)
+    total_pairs = len(pairs)
+    completed_chunks = 0
+    completed_pairs = 0
     if parquet_path is not None:
         parquet_path = Path(parquet_path)
         parquet_path.parent.mkdir(parents=True, exist_ok=True)
@@ -397,6 +401,16 @@ def de_pairs_ebayes(
                 parquet_writer.write_table(
                     frame_to_de_pairs_table(de_pair_chunk_to_frame(pair_chunk, de_pairs_chunk))
                 )
+            completed_chunks += 1
+            completed_pairs += len(pair_chunk)
+            logger.info(
+                'Completed DE chunk %d/%d (%d/%d pairs, %.1f%%)',
+                completed_chunks,
+                total_chunks,
+                completed_pairs,
+                total_pairs,
+                100.0 * completed_pairs / total_pairs,
+            )
     else:
         logger.info(f'Using {n_workers} workers across {len(pair_chunks)} chunks')
         with ProcessPoolExecutor(
@@ -424,6 +438,16 @@ def de_pairs_ebayes(
                     parquet_writer.write_table(
                         frame_to_de_pairs_table(de_pair_chunk_to_frame(pair_chunk, de_pairs_chunk))
                     )
+                completed_chunks += 1
+                completed_pairs += len(pair_chunk)
+                logger.info(
+                    'Completed DE chunk %d/%d (%d/%d pairs, %.1f%%)',
+                    completed_chunks,
+                    total_chunks,
+                    completed_pairs,
+                    total_pairs,
+                    100.0 * completed_pairs / total_pairs,
+                )
 
     if parquet_writer is not None:
         parquet_writer.close()
