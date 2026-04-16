@@ -552,7 +552,7 @@ def de_pairs_ebayes(
             )
     else:
         logger.info(
-            "Using %d workers across %d chunks with joblib backend",
+            "Using %d workers across %d chunks with joblib loky (process) backend",
             n_workers,
             len(pair_chunks),
         )
@@ -567,7 +567,13 @@ def de_pairs_ebayes(
 
         dispatch_start = time.perf_counter()
         logger.info('Dispatching DE chunks to joblib')
-        chunk_results = Parallel(n_jobs=n_workers, prefer='threads')(
+        chunk_results = Parallel(
+            n_jobs=n_workers,
+            backend='loky',
+            prefer='processes',
+            batch_size=1,
+            max_nbytes='10M',
+        )(
             delayed(process_de_pair_chunk_indexed_with_context)(
                 indexed_pair_chunk,
                 cluster_idx,
