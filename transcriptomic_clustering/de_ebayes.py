@@ -1,9 +1,9 @@
 from typing import Optional, Tuple, List, Dict, Union, Any
 from numpy.core.fromnumeric import var
 from numpy.typing import ArrayLike
-import math
 import os
 from pathlib import Path
+import threading
 
 import warnings
 import logging
@@ -217,19 +217,77 @@ def process_de_pair_chunk_indexed_with_context(
     ) -> Tuple[int, Dict[Tuple[Any, Any], Dict[str, Any]]]:
     """Joblib/thread worker entrypoint with explicit context args."""
     chunk_idx, pair_chunk = indexed_pair_chunk
+    worker_pid = os.getpid()
+    worker_tid = threading.get_ident()
+    logger.info(
+        'Worker start DE chunk %d (%d pairs) [pid=%d thread=%d]',
+        chunk_idx + 1,
+        len(pair_chunk),
+        worker_pid,
+        worker_tid,
+    )
+
     de_pairs_chunk = {}
-    for cluster_a, cluster_b in pair_chunk:
-        de_pairs_chunk[(cluster_a, cluster_b)] = compute_de_pair_ebayes(
-            cluster_a=cluster_a,
-            cluster_b=cluster_b,
-            cl_means=cl_means,
-            cl_present=cl_present,
-            cl_size=cl_size,
-            de_thresholds=de_thresholds,
-            sigma_sq_post=sigma_sq_post,
-            stdev_unscaled=stdev_unscaled,
-            df_total=df_total,
-        )
+    total_pairs_in_chunk = len(pair_chunk)
+    progress_interval = max(1, total_pairs_in_chunk // 10)
+    for pair_idx, (cluster_a, cluster_b) in enumerate(pair_chunk, start=1):
+        if pair_idx == 1 or pair_idx % progress_interval == 0 or pair_idx == total_pairs_in_chunk:
+            logger.info(
+                'Worker progress DE chunk %d: pair %d/%d [pid=%d thread=%d]',
+                chunk_idx + 1,
+                pair_idx,
+                total_pairs_in_chunk,
+                worker_pid,
+                worker_tid,
+            )
+
+        pair_start = time.perf_counter()
+        try:
+            de_pairs_chunk[(cluster_a, cluster_b)] = compute_de_pair_ebayes(
+                cluster_a=cluster_a,
+                cluster_b=cluster_b,
+                cl_means=cl_means,
+                cl_present=cl_present,
+                cl_size=cl_size,
+                de_thresholds=de_thresholds,
+                sigma_sq_post=sigma_sq_post,
+                stdev_unscaled=stdev_unscaled,
+                df_total=df_total,
+            )
+        except Exception:
+            logger.exception(
+                'Worker failed DE chunk %d on pair %d/%d (%s, %s) [pid=%d thread=%d]',
+                chunk_idx + 1,
+                pair_idx,
+                total_pairs_in_chunk,
+                str(cluster_a),
+                str(cluster_b),
+                worker_pid,
+                worker_tid,
+            )
+            raise
+
+        pair_elapsed = time.perf_counter() - pair_start
+        if pair_elapsed > 5.0:
+            logger.warning(
+                'Slow DE pair in chunk %d: pair %d/%d (%s, %s) took %.2fs [pid=%d thread=%d]',
+                chunk_idx + 1,
+                pair_idx,
+                total_pairs_in_chunk,
+                str(cluster_a),
+                str(cluster_b),
+                pair_elapsed,
+                worker_pid,
+                worker_tid,
+            )
+
+    logger.info(
+        'Worker finished DE chunk %d (%d pairs) [pid=%d thread=%d]',
+        chunk_idx + 1,
+        len(pair_chunk),
+        worker_pid,
+        worker_tid,
+    )
     return chunk_idx, de_pairs_chunk
 
 
@@ -237,9 +295,19 @@ def chunk_pairs(
         pairs: List[Tuple[Any, Any]],
         n_workers: int,
     ) -> List[List[Tuple[Any, Any]]]:
-    """Split pairs into moderately sized chunks for serial or parallel execution."""
-    chunk_size = max(1, math.ceil(len(pairs) / max(1, n_workers * 4)))
-    return [pairs[idx:idx + chunk_size] for idx in range(0, len(pairs), chunk_size)]
+    """Split pairs into balanced worker batches (roughly one batch per worker)."""
+    n_chunks = max(1, min(n_workers, len(pairs)))
+    base_chunk_size, remainder = divmod(len(pairs), n_chunks)
+
+    chunks: List[List[Tuple[Any, Any]]] = []
+    start_idx = 0
+    for chunk_idx in range(n_chunks):
+        this_chunk_size = base_chunk_size + (1 if chunk_idx < remainder else 0)
+        end_idx = start_idx + this_chunk_size
+        chunks.append(pairs[start_idx:end_idx])
+        start_idx = end_idx
+
+    return chunks
 
 
 def de_pair_chunk_to_frame(
@@ -332,10 +400,16 @@ def de_pairs_ebayes(
     if len(pairs) == 0:
         return pd.DataFrame()
 
+    overall_start = time.perf_counter()
     logger.info('Fitting Variances')
+    fit_start = time.perf_counter()
     sigma_sq, df, stdev_unscaled = get_linear_fit_vals(cl_vars, cl_size)
+    logger.info('Finished fitting variances in %.2fs', time.perf_counter() - fit_start)
+
     logger.info('Moderating Variances')
+    mod_start = time.perf_counter()
     sigma_sq_post, var_prior, df_prior = moderate_variances(sigma_sq, df)
+    logger.info('Finished moderating variances in %.2fs', time.perf_counter() - mod_start)
 
     logger.info(f'Comparing {len(pairs)} pairs')
     if n_cores is None:
@@ -349,21 +423,36 @@ def de_pairs_ebayes(
     df_total = df + df_prior
     df_pooled = np.sum(df)
     df_total = min(df_total, df_pooled)
+    logger.info('Using n_workers=%d, df_total=%.4f, df_pooled=%.4f', n_workers, df_total, df_pooled)
 
+    chunking_start = time.perf_counter()
     pair_chunks = chunk_pairs(pairs, n_workers)
+    logger.info('Prepared chunking in %.2fs', time.perf_counter() - chunking_start)
     total_chunks = len(pair_chunks)
     total_pairs = len(pairs)
+    chunk_sizes = [len(chunk) for chunk in pair_chunks]
+    logger.info(
+        'Chunk summary: chunks=%d, min=%d, max=%d, median=%.1f pairs/chunk',
+        total_chunks,
+        min(chunk_sizes),
+        max(chunk_sizes),
+        float(np.median(chunk_sizes)),
+    )
     completed_chunks = 0
     completed_pairs = 0
     if parquet_path is not None:
         parquet_path = Path(parquet_path)
+        logger.info('Preparing parquet output at %s', str(parquet_path))
         parquet_path.parent.mkdir(parents=True, exist_ok=True)
         if parquet_path.exists():
+            logger.info('Removing existing parquet output at %s', str(parquet_path))
             parquet_path.unlink()
         parquet_writer = pq.ParquetWriter(parquet_path, make_de_pairs_table_schema())
+        logger.info('Parquet writer initialized')
     else:
         parquet_writer = None
         de_pairs = {}
+        logger.info('Using in-memory DE result accumulation')
 
     if n_workers == 1:
         for pair_chunk in pair_chunks:
@@ -386,8 +475,15 @@ def de_pairs_ebayes(
             if parquet_writer is None:
                 de_pairs.update(de_pairs_chunk)
             else:
+                write_start = time.perf_counter()
                 parquet_writer.write_table(
                     frame_to_de_pairs_table(de_pair_chunk_to_frame(pair_chunk, de_pairs_chunk))
+                )
+                logger.info(
+                    'Finished writing DE chunk %d/%d to parquet in %.2fs',
+                    completed_chunks + 1,
+                    total_chunks,
+                    time.perf_counter() - write_start,
                 )
             completed_chunks += 1
             completed_pairs += len(pair_chunk)
@@ -414,6 +510,8 @@ def de_pairs_ebayes(
                 len(pair_chunk),
             )
 
+        dispatch_start = time.perf_counter()
+        logger.info('Dispatching DE chunks to joblib')
         chunk_results = Parallel(n_jobs=n_workers, prefer='threads')(
             delayed(process_de_pair_chunk_indexed_with_context)(
                 indexed_pair_chunk,
@@ -427,13 +525,25 @@ def de_pairs_ebayes(
             )
             for indexed_pair_chunk in indexed_chunks
         )
+        logger.info(
+            'Joblib returned %d chunk results in %.2fs',
+            len(chunk_results),
+            time.perf_counter() - dispatch_start,
+        )
         for chunk_idx, de_pairs_chunk in chunk_results:
             pair_chunk = pair_chunks[chunk_idx]
             if parquet_writer is None:
                 de_pairs.update(de_pairs_chunk)
             else:
+                write_start = time.perf_counter()
                 parquet_writer.write_table(
                     frame_to_de_pairs_table(de_pair_chunk_to_frame(pair_chunk, de_pairs_chunk))
+                )
+                logger.info(
+                    'Finished writing DE chunk %d/%d to parquet in %.2fs',
+                    completed_chunks + 1,
+                    total_chunks,
+                    time.perf_counter() - write_start,
                 )
             completed_chunks += 1
             completed_pairs += len(pair_chunk)
@@ -447,9 +557,20 @@ def de_pairs_ebayes(
             )
 
     if parquet_writer is not None:
+        close_start = time.perf_counter()
         parquet_writer.close()
+        logger.info('Closed parquet writer in %.2fs', time.perf_counter() - close_start)
+        logger.info('Completed DE pairs run in %.2fs', time.perf_counter() - overall_start)
         return parquet_path
 
+    frame_start = time.perf_counter()
+    logger.info('Building DE result dataframe from %d pair entries', len(de_pairs))
     de_pairs_df = pd.DataFrame(de_pairs).T
     de_pairs_df = de_pairs_df.reindex(pd.MultiIndex.from_tuples(pairs))
+    logger.info(
+        'Built DE result dataframe with shape %s in %.2fs',
+        str(de_pairs_df.shape),
+        time.perf_counter() - frame_start,
+    )
+    logger.info('Completed DE pairs run in %.2fs', time.perf_counter() - overall_start)
     return de_pairs_df
