@@ -1,5 +1,4 @@
 from typing import Optional, Tuple, List, Dict, Union, Any
-from numpy.core.fromnumeric import var
 from numpy.typing import ArrayLike
 import os
 from pathlib import Path
@@ -16,10 +15,10 @@ import pyarrow as pa
 import pyarrow.parquet as pq
 from scipy import stats
 from scipy.special import digamma, polygamma
-from statsmodels.stats.multitest import multipletests
 from joblib import Parallel, delayed
+from statsmodels.stats.multitest import multipletests
 
-from .diff_expression import get_qdiff, filter_gene_stats, calc_de_score
+from .diff_expression import get_qdiff, calc_de_score
 
 logger = logging.getLogger(__name__)
 
@@ -143,76 +142,98 @@ def get_linear_fit_vals(cl_vars: pd.DataFrame, cl_size: Dict[Any, int]):
 def compute_de_pair_ebayes(
         cluster_a: Any,
         cluster_b: Any,
-        cl_means: pd.DataFrame,
-        cl_present: pd.DataFrame,
+        cluster_idx: Dict[Any, int],
+        cl_means_np: np.ndarray,
+        cl_present_np: np.ndarray,
+        gene_names: np.ndarray,
         cl_size: Dict[Any, int],
         de_thresholds: Dict[str, Any],
-        sigma_sq_post: pd.DataFrame,
-        stdev_unscaled: pd.DataFrame,
+        sigma_sqrt: np.ndarray,
+        stdev_unscaled_np: np.ndarray,
         df_total: float,
     ) -> Dict[str, Any]:
-    """Compute DE statistics for a single cluster pair."""
-    means_diff = cl_means.loc[cluster_a] - cl_means.loc[cluster_b]
-    means_diff = means_diff.to_frame()
-    stdev_unscaled_comb = np.sqrt(np.sum(stdev_unscaled.loc[[cluster_a, cluster_b]] ** 2))[0]
+    """Compute DE statistics for a single cluster pair using array operations."""
+    idx_a = cluster_idx[cluster_a]
+    idx_b = cluster_idx[cluster_b]
 
-    t_vals = means_diff / np.sqrt(sigma_sq_post) / stdev_unscaled_comb
+    mean_a = cl_means_np[idx_a]
+    mean_b = cl_means_np[idx_b]
+    means_diff = mean_a - mean_b
+    stdev_unscaled_comb = np.hypot(stdev_unscaled_np[idx_a], stdev_unscaled_np[idx_b])
 
-    p_vals = 2 * stats.t.sf(np.abs(t_vals[0]), df_total)
+    t_vals = means_diff / sigma_sqrt / stdev_unscaled_comb
+    p_vals = 2 * stats.t.sf(np.abs(t_vals), df_total)
     _, p_adj, _, _ = multipletests(
         p_vals,
-        alpha=de_thresholds['padj_thresh'],
         method='holm',
+        is_sorted=False,
     )
 
-    de_pair_stats = pd.DataFrame(index=cl_means.columns)
-    de_pair_stats['p_value'] = p_vals
-    de_pair_stats['p_adj'] = p_adj
-    de_pair_stats['lfc'] = means_diff
-    de_pair_stats["meanA"] = cl_means.loc[cluster_a]
-    de_pair_stats["meanB"] = cl_means.loc[cluster_b]
-    de_pair_stats["q1"] = cl_present.loc[cluster_a]
-    de_pair_stats["q2"] = cl_present.loc[cluster_b]
-    de_pair_stats["qdiff"] = get_qdiff(cl_present.loc[cluster_a], cl_present.loc[cluster_b])
+    q1 = cl_present_np[idx_a]
+    q2 = cl_present_np[idx_b]
+    qdiff = get_qdiff(q1, q2)
+    abs_lfc = np.abs(means_diff)
+    abs_qdiff = np.abs(qdiff)
 
-    de_pair_up = filter_gene_stats(
-        de_stats=de_pair_stats,
-        gene_type='up-regulated',
-        cl1_size=cl_size[cluster_a],
-        cl2_size=cl_size[cluster_b],
-        **de_thresholds
-    )
-    up_score = calc_de_score(de_pair_up['p_adj'].values)
+    q1_thresh = de_thresholds.get('q1_thresh')
+    q2_thresh = de_thresholds.get('q2_thresh')
+    cluster_size_thresh = de_thresholds.get('cluster_size_thresh')
+    qdiff_thresh = de_thresholds.get('qdiff_thresh')
+    padj_thresh = de_thresholds.get('padj_thresh')
+    lfc_thresh = de_thresholds.get('lfc_thresh')
 
-    de_pair_down = filter_gene_stats(
-        de_stats=de_pair_stats,
-        gene_type='down-regulated',
-        cl1_size=cl_size[cluster_a],
-        cl2_size=cl_size[cluster_b],
-        **de_thresholds
-    )
-    down_score = calc_de_score(de_pair_down['p_adj'].values)
+    up_mask = means_diff > 0
+    down_mask = means_diff < 0
+
+    if padj_thresh:
+        sig_mask = p_adj < padj_thresh
+        up_mask &= sig_mask
+        down_mask &= sig_mask
+    if lfc_thresh:
+        lfc_mask = abs_lfc > lfc_thresh
+        up_mask &= lfc_mask
+        down_mask &= lfc_mask
+    if q1_thresh:
+        up_mask &= q1 > q1_thresh
+        down_mask &= q2 > q1_thresh
+    if cluster_size_thresh:
+        up_mask &= q1 * cl_size[cluster_a] >= cluster_size_thresh
+        down_mask &= q2 * cl_size[cluster_b] >= cluster_size_thresh
+    if q2_thresh:
+        up_mask &= q2 < q2_thresh
+        down_mask &= q1 < q2_thresh
+    if qdiff_thresh:
+        qdiff_mask = abs_qdiff > qdiff_thresh
+        up_mask &= qdiff_mask
+        down_mask &= qdiff_mask
+
+    up_genes = gene_names[up_mask].tolist()
+    down_genes = gene_names[down_mask].tolist()
+    up_score = calc_de_score(p_adj[up_mask])
+    down_score = calc_de_score(p_adj[down_mask])
 
     return {
         'score': up_score + down_score,
         'up_score': up_score,
         'down_score': down_score,
-        'up_genes': de_pair_up.index.to_list(),
-        'down_genes': de_pair_down.index.to_list(),
-        'up_num': len(de_pair_up.index),
-        'down_num': len(de_pair_down.index),
-        'num': len(de_pair_up.index) + len(de_pair_down.index)
+        'up_genes': up_genes,
+        'down_genes': down_genes,
+        'up_num': len(up_genes),
+        'down_num': len(down_genes),
+        'num': len(up_genes) + len(down_genes)
     }
 
 
 def process_de_pair_chunk_indexed_with_context(
         indexed_pair_chunk: Tuple[int, List[Tuple[Any, Any]]],
-        cl_means: pd.DataFrame,
-        cl_present: pd.DataFrame,
+        cluster_idx: Dict[Any, int],
+        cl_means_np: np.ndarray,
+        cl_present_np: np.ndarray,
+        gene_names: np.ndarray,
         cl_size: Dict[Any, int],
         de_thresholds: Dict[str, Any],
-        sigma_sq_post: pd.DataFrame,
-        stdev_unscaled: pd.DataFrame,
+        sigma_sqrt: np.ndarray,
+        stdev_unscaled_np: np.ndarray,
         df_total: float,
     ) -> Tuple[int, Dict[Tuple[Any, Any], Dict[str, Any]]]:
     """Joblib/thread worker entrypoint with explicit context args."""
@@ -246,12 +267,14 @@ def process_de_pair_chunk_indexed_with_context(
             de_pairs_chunk[(cluster_a, cluster_b)] = compute_de_pair_ebayes(
                 cluster_a=cluster_a,
                 cluster_b=cluster_b,
-                cl_means=cl_means,
-                cl_present=cl_present,
+                cluster_idx=cluster_idx,
+                cl_means_np=cl_means_np,
+                cl_present_np=cl_present_np,
+                gene_names=gene_names,
                 cl_size=cl_size,
                 de_thresholds=de_thresholds,
-                sigma_sq_post=sigma_sq_post,
-                stdev_unscaled=stdev_unscaled,
+                sigma_sqrt=sigma_sqrt,
+                stdev_unscaled_np=stdev_unscaled_np,
                 df_total=df_total,
             )
         except Exception:
@@ -425,6 +448,36 @@ def de_pairs_ebayes(
     df_total = min(df_total, df_pooled)
     logger.info('Using n_workers=%d, df_total=%.4f, df_pooled=%.4f', n_workers, df_total, df_pooled)
 
+    context_start = time.perf_counter()
+    cluster_labels = cl_means.index.to_list()
+    cluster_idx = {cluster: idx for idx, cluster in enumerate(cluster_labels)}
+    cl_means_np = np.asarray(cl_means.to_numpy(), dtype=np.float64)
+    cl_present_np = np.asarray(
+        cl_present.reindex(index=cluster_labels, columns=cl_means.columns).to_numpy(),
+        dtype=np.float64,
+    )
+    gene_names = cl_means.columns.to_numpy()
+    sigma_sqrt = np.sqrt(
+        np.asarray(np.squeeze(sigma_sq_post.reindex(cl_means.columns).to_numpy()), dtype=np.float64)
+    )
+    stdev_unscaled_np = np.asarray(
+        np.squeeze(stdev_unscaled.reindex(cluster_labels).to_numpy()),
+        dtype=np.float64,
+    )
+    logger.info("Using p-value adjustment method 'holm'")
+    if np.isnan(cl_present_np).any():
+        logger.warning('NaNs detected in cl_present after alignment to cluster/gene order')
+    if np.isnan(cl_means_np).any():
+        logger.warning('NaNs detected in cl_means array context')
+    if np.isnan(sigma_sqrt).any() or np.isnan(stdev_unscaled_np).any():
+        logger.warning('NaNs detected in DE variance context arrays')
+    logger.info(
+        'Prepared DE array context in %.2fs (clusters=%d, genes=%d)',
+        time.perf_counter() - context_start,
+        len(cluster_labels),
+        gene_names.shape[0],
+    )
+
     chunking_start = time.perf_counter()
     pair_chunks = chunk_pairs(pairs, n_workers)
     logger.info('Prepared chunking in %.2fs', time.perf_counter() - chunking_start)
@@ -464,12 +517,14 @@ def de_pairs_ebayes(
             )
             de_pairs_chunk = process_de_pair_chunk_indexed_with_context(
                 (completed_chunks, pair_chunk),
-                cl_means,
-                cl_present,
+                cluster_idx,
+                cl_means_np,
+                cl_present_np,
+                gene_names,
                 cl_size,
                 de_thresholds,
-                sigma_sq_post,
-                stdev_unscaled,
+                sigma_sqrt,
+                stdev_unscaled_np,
                 df_total,
             )[1]
             if parquet_writer is None:
@@ -515,12 +570,14 @@ def de_pairs_ebayes(
         chunk_results = Parallel(n_jobs=n_workers, prefer='threads')(
             delayed(process_de_pair_chunk_indexed_with_context)(
                 indexed_pair_chunk,
-                cl_means,
-                cl_present,
+                cluster_idx,
+                cl_means_np,
+                cl_present_np,
+                gene_names,
                 cl_size,
                 de_thresholds,
-                sigma_sq_post,
-                stdev_unscaled,
+                sigma_sqrt,
+                stdev_unscaled_np,
                 df_total,
             )
             for indexed_pair_chunk in indexed_chunks
