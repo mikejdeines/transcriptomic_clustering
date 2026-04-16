@@ -160,6 +160,35 @@ def test_de_pairs_ebayes_parallel_matches_serial(cl_stats, thresholds):
     assert_frame_equal(de_pairs_parallel, de_pairs_serial)
 
 
+def test_de_pairs_ebayes_joblib_matches_serial(cl_stats, thresholds):
+    cl_means = cl_stats['cl_means']
+    cl_vars = cl_stats['cl_vars']
+    cl_present = cl_stats['cl_present']
+    cl_size = cl_stats['cl_size']
+    pairs = [('a', 'b'), ('a', 'c'), ('b', 'c')]
+
+    de_pairs_serial = de_pairs_ebayes(
+        pairs,
+        cl_means,
+        cl_vars,
+        cl_present,
+        cl_size,
+        thresholds,
+        n_cores=1,
+    )
+    de_pairs_joblib = de_pairs_ebayes(
+        pairs,
+        cl_means,
+        cl_vars,
+        cl_present,
+        cl_size,
+        thresholds,
+        n_cores=2,
+    )
+
+    assert_frame_equal(de_pairs_joblib, de_pairs_serial)
+
+
 def test_de_pairs_ebayes_parquet_matches_serial(cl_stats, thresholds, tmp_path):
     cl_means = cl_stats['cl_means']
     cl_vars = cl_stats['cl_vars']

@@ -1,7 +1,6 @@
 from typing import Optional, Tuple, List, Dict, Union, Any
 from numpy.core.fromnumeric import var
 from numpy.typing import ArrayLike
-import multiprocessing as mp
 import math
 import os
 from pathlib import Path
@@ -18,12 +17,11 @@ import pyarrow.parquet as pq
 from scipy import stats
 from scipy.special import digamma, polygamma
 from statsmodels.stats.multitest import multipletests
+from joblib import Parallel, delayed
 
 from .diff_expression import get_qdiff, filter_gene_stats, calc_de_score
 
 logger = logging.getLogger(__name__)
-
-_DE_PAIR_CONTEXT = None
 
 """
 Implements functions for calculating differential expression
@@ -207,7 +205,8 @@ def compute_de_pair_ebayes(
     }
 
 
-def init_de_pair_worker(
+def process_de_pair_chunk_indexed_with_context(
+        indexed_pair_chunk: Tuple[int, List[Tuple[Any, Any]]],
         cl_means: pd.DataFrame,
         cl_present: pd.DataFrame,
         cl_size: Dict[Any, int],
@@ -215,45 +214,23 @@ def init_de_pair_worker(
         sigma_sq_post: pd.DataFrame,
         stdev_unscaled: pd.DataFrame,
         df_total: float,
-    ):
-    """Initialize global context for DE worker processes."""
-    global _DE_PAIR_CONTEXT
-    _DE_PAIR_CONTEXT = {
-        'cl_means': cl_means,
-        'cl_present': cl_present,
-        'cl_size': cl_size,
-        'de_thresholds': de_thresholds,
-        'sigma_sq_post': sigma_sq_post,
-        'stdev_unscaled': stdev_unscaled,
-        'df_total': df_total,
-    }
-
-
-def process_de_pair_chunk(pair_chunk: List[Tuple[Any, Any]]) -> Dict[Tuple[Any, Any], Dict[str, Any]]:
-    """Compute DE stats for a chunk of cluster pairs in one worker."""
-    context = _DE_PAIR_CONTEXT
+    ) -> Tuple[int, Dict[Tuple[Any, Any], Dict[str, Any]]]:
+    """Joblib/thread worker entrypoint with explicit context args."""
+    chunk_idx, pair_chunk = indexed_pair_chunk
     de_pairs_chunk = {}
     for cluster_a, cluster_b in pair_chunk:
         de_pairs_chunk[(cluster_a, cluster_b)] = compute_de_pair_ebayes(
             cluster_a=cluster_a,
             cluster_b=cluster_b,
-            cl_means=context['cl_means'],
-            cl_present=context['cl_present'],
-            cl_size=context['cl_size'],
-            de_thresholds=context['de_thresholds'],
-            sigma_sq_post=context['sigma_sq_post'],
-            stdev_unscaled=context['stdev_unscaled'],
-            df_total=context['df_total'],
+            cl_means=cl_means,
+            cl_present=cl_present,
+            cl_size=cl_size,
+            de_thresholds=de_thresholds,
+            sigma_sq_post=sigma_sq_post,
+            stdev_unscaled=stdev_unscaled,
+            df_total=df_total,
         )
-    return de_pairs_chunk
-
-
-def process_de_pair_chunk_indexed(
-        indexed_pair_chunk: Tuple[int, List[Tuple[Any, Any]]]
-    ) -> Tuple[int, Dict[Tuple[Any, Any], Dict[str, Any]]]:
-    """Worker entrypoint that preserves the source chunk index."""
-    chunk_idx, pair_chunk = indexed_pair_chunk
-    return chunk_idx, process_de_pair_chunk(pair_chunk)
+    return chunk_idx, de_pairs_chunk
 
 
 def chunk_pairs(
@@ -390,19 +367,22 @@ def de_pairs_ebayes(
 
     if n_workers == 1:
         for pair_chunk in pair_chunks:
-            de_pairs_chunk = {}
-            for cluster_a, cluster_b in pair_chunk:
-                de_pairs_chunk[(cluster_a, cluster_b)] = compute_de_pair_ebayes(
-                    cluster_a=cluster_a,
-                    cluster_b=cluster_b,
-                    cl_means=cl_means,
-                    cl_present=cl_present,
-                    cl_size=cl_size,
-                    de_thresholds=de_thresholds,
-                    sigma_sq_post=sigma_sq_post,
-                    stdev_unscaled=stdev_unscaled,
-                    df_total=df_total,
-                )
+            logger.info(
+                'Spawning DE chunk %d/%d (%d pairs) [serial]',
+                completed_chunks + 1,
+                total_chunks,
+                len(pair_chunk),
+            )
+            de_pairs_chunk = process_de_pair_chunk_indexed_with_context(
+                (completed_chunks, pair_chunk),
+                cl_means,
+                cl_present,
+                cl_size,
+                de_thresholds,
+                sigma_sq_post,
+                stdev_unscaled,
+                df_total,
+            )[1]
             if parquet_writer is None:
                 de_pairs.update(de_pairs_chunk)
             else:
@@ -420,47 +400,51 @@ def de_pairs_ebayes(
                 100.0 * completed_pairs / total_pairs,
             )
     else:
-        logger.info(f'Using {n_workers} workers across {len(pair_chunks)} chunks')
-        mp_context = mp.get_context('fork')
-        logger.info("Using multiprocessing start method 'fork'")
-
+        logger.info(
+            "Using %d workers across %d chunks with joblib backend",
+            n_workers,
+            len(pair_chunks),
+        )
         indexed_chunks = list(enumerate(pair_chunks))
-        with mp_context.Pool(
-            processes=n_workers,
-                initializer=init_de_pair_worker,
-                initargs=(
-                    cl_means,
-                    cl_present,
-                    cl_size,
-                    de_thresholds,
-                    sigma_sq_post,
-                    stdev_unscaled,
-                    df_total,
-                ),
-                maxtasksperchild=100,
-            ) as pool:
-            for chunk_idx, de_pairs_chunk in pool.imap_unordered(
-                process_de_pair_chunk_indexed,
-                indexed_chunks,
-                chunksize=1,
-            ):
-                pair_chunk = pair_chunks[chunk_idx]
-                if parquet_writer is None:
-                    de_pairs.update(de_pairs_chunk)
-                else:
-                    parquet_writer.write_table(
-                        frame_to_de_pairs_table(de_pair_chunk_to_frame(pair_chunk, de_pairs_chunk))
-                    )
-                completed_chunks += 1
-                completed_pairs += len(pair_chunk)
-                logger.info(
-                    'Completed DE chunk %d/%d (%d/%d pairs, %.1f%%)',
-                    completed_chunks,
-                    total_chunks,
-                    completed_pairs,
-                    total_pairs,
-                    100.0 * completed_pairs / total_pairs,
+        for chunk_idx, pair_chunk in indexed_chunks:
+            logger.info(
+                'Spawning DE chunk %d/%d (%d pairs)',
+                chunk_idx + 1,
+                total_chunks,
+                len(pair_chunk),
+            )
+
+        chunk_results = Parallel(n_jobs=n_workers, prefer='threads')(
+            delayed(process_de_pair_chunk_indexed_with_context)(
+                indexed_pair_chunk,
+                cl_means,
+                cl_present,
+                cl_size,
+                de_thresholds,
+                sigma_sq_post,
+                stdev_unscaled,
+                df_total,
+            )
+            for indexed_pair_chunk in indexed_chunks
+        )
+        for chunk_idx, de_pairs_chunk in chunk_results:
+            pair_chunk = pair_chunks[chunk_idx]
+            if parquet_writer is None:
+                de_pairs.update(de_pairs_chunk)
+            else:
+                parquet_writer.write_table(
+                    frame_to_de_pairs_table(de_pair_chunk_to_frame(pair_chunk, de_pairs_chunk))
                 )
+            completed_chunks += 1
+            completed_pairs += len(pair_chunk)
+            logger.info(
+                'Completed DE chunk %d/%d (%d/%d pairs, %.1f%%)',
+                completed_chunks,
+                total_chunks,
+                completed_pairs,
+                total_pairs,
+                100.0 * completed_pairs / total_pairs,
+            )
 
     if parquet_writer is not None:
         parquet_writer.close()
